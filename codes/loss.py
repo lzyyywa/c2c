@@ -9,8 +9,18 @@ import torch.nn as nn
 import torch
 import numpy as np
 
+# [NEW] Import Hyperbolic Operations
+# Ensure codes/utils/hyperbolic_ops.py exists
+try:
+    from utils.hyperbolic_ops import LorentzMath
+except ImportError:
+    print("Warning: Could not import LorentzMath from utils.hyperbolic_ops. Hyperbolic losses will not work.")
 
 def loss_calu(predict, target, config):
+    """
+    Original loss calculation function. 
+    Kept for backward compatibility or if you want to switch back to Euclidean baseline.
+    """
     loss_fn = CrossEntropyLoss()
     batch_img, batch_attr, batch_obj, batch_target = target
     batch_attr = batch_attr.cuda()
@@ -24,6 +34,99 @@ def loss_calu(predict, target, config):
     loss = loss_logit_df + config.att_obj_w * (loss_att + loss_obj) + config.sp_w * loss_logit_sp
     return loss
 
+# =========================================================================
+# [NEW] Hyperbolic Losses for C2C Migration
+# =========================================================================
+
+class HyperbolicPrototypicalLoss(nn.Module):
+    """
+    Discriminative Loss in Hyperbolic Space.
+    Replaces Standard CrossEntropy/Cosine Loss.
+    
+    Inputs are expected to be Hyperbolic Embeddings (with time dimension).
+    We calculate the negative hyperbolic distance as logits.
+    """
+    def __init__(self, temperature=0.1, c=1.0):
+        super(HyperbolicPrototypicalLoss, self).__init__()
+        self.temperature = temperature
+        self.c = c
+        self.loss_fn = nn.CrossEntropyLoss()
+
+    def forward(self, query_emb, prototype_emb, targets):
+        """
+        Args:
+            query_emb: [Batch, Dim+1] (e.g., Video Features in Hyp Space)
+            prototype_emb: [Num_Classes, Dim+1] (e.g., Verb/Object Text Features in Hyp Space)
+            targets: [Batch] Class Indices
+        """
+        # Expand dims for broadcasting
+        # query: [B, 1, D]
+        # proto: [1, N, D]
+        q = query_emb.unsqueeze(1)
+        p = prototype_emb.unsqueeze(0)
+        
+        # Calculate Hyperbolic Distance
+        # dists shape: [Batch, Num_Classes]
+        dists = LorentzMath.hyp_distance(q, p, c=self.c)
+        
+        # Convert to logits: closer distance = higher probability
+        # Logits = -distance / T
+        logits = -dists / self.temperature
+        
+        # Calculate Cross Entropy
+        return self.loss_fn(logits, targets)
+
+class EntailmentConeLoss(nn.Module):
+    """
+    Hierarchical Entailment Cone Loss.
+    Enforces that 'child' embeddings lie within the 'cone' of 'parent' embeddings.
+    
+    Used for:
+    1. Verb -> Coarse Verb
+    2. Object -> Coarse Object
+    3. Composition -> Verb
+    4. Composition -> Object
+    """
+    def __init__(self, aperture=0.01, margin=0.01):
+        super(EntailmentConeLoss, self).__init__()
+        self.aperture = aperture  # Cone aperture angle (K in paper)
+        self.margin = margin
+
+    def forward(self, child_emb, parent_emb):
+        """
+        Args:
+            child_emb: [Batch, Dim+1] 
+            parent_emb: [Batch, Dim+1] (Must be aligned: parent_emb[i] is parent of child_emb[i])
+        """
+        # 1. Depth Check (Norm Penalty)
+        # In Lorentz model, x[0] (time component) represents distance from origin.
+        # Parent (abstract) should be closer to origin (smaller x[0]) than Child (specific).
+        # We want: child_x0 > parent_x0
+        
+        child_r = child_emb[..., 0]
+        parent_r = parent_emb[..., 0]
+        
+        # Penalty if parent is further or equal to child (plus margin)
+        # Loss = max(0, parent_r - child_r + margin)
+        depth_loss = F.relu(parent_r - child_r + self.margin)
+
+        # 2. Angle Check (Cone Boundary)
+        # Cosine similarity in the space components (approximation of angle in tangent space)
+        child_space = child_emb[..., 1:]
+        parent_space = parent_emb[..., 1:]
+        
+        # Cosine similarity
+        cos_sim = F.cosine_similarity(child_space, parent_space, dim=-1)
+        
+        # We want cos_sim > (1 - aperture)
+        # If cos_sim is smaller, it means angle is too large -> Penalty
+        angle_loss = F.relu((1.0 - self.aperture) - cos_sim)
+
+        return depth_loss.mean() + angle_loss.mean()
+
+# =========================================================================
+# [END] New Hyperbolic Losses
+# =========================================================================
 
 class KLLoss(nn.Module):
     """Loss that uses a 'hinge' on the lower bound.
