@@ -75,7 +75,10 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
     
     # Inject text information into the model
     coarse_verbs, coarse_objs = helper.get_coarse_info()
-    model.set_hierarchy_prompts(coarse_verbs, coarse_objs, train_dataset.pairs)
+    if isinstance(model, torch.nn.DataParallel) or isinstance(model, torch.nn.parallel.DistributedDataParallel):
+        model.module.set_hierarchy_prompts(coarse_verbs, coarse_objs, train_dataset.pairs)
+    else:
+        model.set_hierarchy_prompts(coarse_verbs, coarse_objs, train_dataset.pairs)
     
     # Get mapping tables (GPU Tensor)
     v2cv, o2co, p2v, p2o = helper.get_mappings()
