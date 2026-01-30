@@ -42,9 +42,6 @@ class HyperbolicPrototypicalLoss(nn.Module):
     """
     Discriminative Loss in Hyperbolic Space.
     Replaces Standard CrossEntropy/Cosine Loss.
-    
-    Inputs are expected to be Hyperbolic Embeddings (with time dimension).
-    We calculate the negative hyperbolic distance as logits.
     """
     def __init__(self, temperature=0.1, c=1.0):
         super(HyperbolicPrototypicalLoss, self).__init__()
@@ -53,12 +50,6 @@ class HyperbolicPrototypicalLoss(nn.Module):
         self.loss_fn = nn.CrossEntropyLoss()
 
     def forward(self, query_emb, prototype_emb, targets):
-        """
-        Args:
-            query_emb: [Batch, Dim+1] (e.g., Video Features in Hyp Space)
-            prototype_emb: [Num_Classes, Dim+1] (e.g., Verb/Object Text Features in Hyp Space)
-            targets: [Batch] Class Indices
-        """
         # Expand dims for broadcasting
         # query: [B, 1, D]
         # proto: [1, N, D]
@@ -66,7 +57,6 @@ class HyperbolicPrototypicalLoss(nn.Module):
         p = prototype_emb.unsqueeze(0)
         
         # Calculate Hyperbolic Distance
-        # dists shape: [Batch, Num_Classes]
         dists = LorentzMath.hyp_distance(q, p, c=self.c)
         
         # Convert to logits: closer distance = higher probability
@@ -80,12 +70,6 @@ class EntailmentConeLoss(nn.Module):
     """
     Hierarchical Entailment Cone Loss.
     Enforces that 'child' embeddings lie within the 'cone' of 'parent' embeddings.
-    
-    Used for:
-    1. Verb -> Coarse Verb
-    2. Object -> Coarse Object
-    3. Composition -> Verb
-    4. Composition -> Object
     """
     def __init__(self, aperture=0.01, margin=0.01):
         super(EntailmentConeLoss, self).__init__()
@@ -93,50 +77,86 @@ class EntailmentConeLoss(nn.Module):
         self.margin = margin
 
     def forward(self, child_emb, parent_emb):
-        """
-        Args:
-            child_emb: [Batch, Dim+1] 
-            parent_emb: [Batch, Dim+1] (Must be aligned: parent_emb[i] is parent of child_emb[i])
-        """
         # 1. Depth Check (Norm Penalty)
-        # In Lorentz model, x[0] (time component) represents distance from origin.
-        # Parent (abstract) should be closer to origin (smaller x[0]) than Child (specific).
-        # We want: child_x0 > parent_x0
-        
         child_r = child_emb[..., 0]
         parent_r = parent_emb[..., 0]
         
         # Penalty if parent is further or equal to child (plus margin)
-        # Loss = max(0, parent_r - child_r + margin)
         depth_loss = F.relu(parent_r - child_r + self.margin)
 
         # 2. Angle Check (Cone Boundary)
-        # Cosine similarity in the space components (approximation of angle in tangent space)
         child_space = child_emb[..., 1:]
         parent_space = parent_emb[..., 1:]
         
-        # Cosine similarity
         cos_sim = F.cosine_similarity(child_space, parent_space, dim=-1)
         
         # We want cos_sim > (1 - aperture)
-        # If cos_sim is smaller, it means angle is too large -> Penalty
         angle_loss = F.relu((1.0 - self.aperture) - cos_sim)
 
         return depth_loss.mean() + angle_loss.mean()
+
+# =========================================================================
+# [NEW] H2EM Total Loss Wrapper (你刚才漏掉的就是这个类！)
+# =========================================================================
+
+class H2EMTotalLoss(nn.Module):
+    """
+    H2EM Paper Eq. (16) Wrapper.
+    Total Loss = beta1 * L_DA + beta2 * L_TE + beta3 * L_prim
+    """
+    def __init__(self, temperature=0.1, beta1=1.0, beta2=0.1, beta3=0.5):
+        super(H2EMTotalLoss, self).__init__()
+        self.beta1 = beta1 # DA (Discriminative Alignment / Pair)
+        self.beta2 = beta2 # TE (Taxonomic Entailment / Hierarchy)
+        self.beta3 = beta3 # Prim (Primitive Auxiliary / Verb+Obj)
+        
+        self.loss_cls = HyperbolicPrototypicalLoss(temperature=temperature)
+        self.loss_cone = EntailmentConeLoss(aperture=0.1, margin=0.01)
+
+    def forward(self, out, batch_verb, batch_obj, batch_target, p2v_map, p2o_map, v2cv_map, o2co_map):
+        # Unpack
+        v_feat_hyp = out['v_feat_hyp']
+        o_feat_hyp = out['o_feat_hyp']
+        verb_text_hyp = out['verb_text_hyp']
+        obj_text_hyp = out['obj_text_hyp']
+        coarse_verb_hyp = out['coarse_verb_hyp']
+        coarse_obj_hyp = out['coarse_obj_hyp']
+        comp_hyp = out['comp_hyp']
+        verb_logits = out['verb_logits']
+        obj_logits = out['obj_logits']
+
+        # A. Primitive Auxiliary (L_s + L_o)
+        L_s = self.loss_cls(v_feat_hyp, verb_text_hyp, batch_verb)
+        L_o = self.loss_cls(o_feat_hyp, obj_text_hyp, batch_obj)
+        L_prim = L_s + L_o
+
+        # B. Discriminative Alignment (L_DA)
+        pair_logits = verb_logits[:, p2v_map] + obj_logits[:, p2o_map]
+        L_DA = F.cross_entropy(pair_logits / self.loss_cls.temperature, batch_target)
+
+        # C. Taxonomic Entailment (L_TE)
+        loss_h1 = self.loss_cone(verb_text_hyp, coarse_verb_hyp[v2cv_map])
+        loss_h2 = self.loss_cone(obj_text_hyp, coarse_obj_hyp[o2co_map])
+        loss_h3 = self.loss_cone(comp_hyp, verb_text_hyp[p2v_map])
+        loss_h4 = self.loss_cone(comp_hyp, obj_text_hyp[p2o_map])
+        L_TE = loss_h1 + loss_h2 + loss_h3 + loss_h4
+
+        # Total Loss
+        loss = self.beta1 * L_DA + self.beta2 * L_TE + self.beta3 * L_prim
+        
+        return loss, {
+            "Total": loss.item(),
+            "Prim": L_prim.item(),
+            "DA": L_DA.item(),
+            "TE": L_TE.item()
+        }
 
 # =========================================================================
 # [END] New Hyperbolic Losses
 # =========================================================================
 
 class KLLoss(nn.Module):
-    """Loss that uses a 'hinge' on the lower bound.
-    This means that for samples with a label value smaller than the threshold, the loss is zero if the prediction is
-    also smaller than that threshold.
-    args:
-        error_matric:  What base loss to use (MSE by default).
-        threshold:  Threshold to use for the hinge.
-        clip:  Clip the loss if it is above this value.
-    """
+    """Loss that uses a 'hinge' on the lower bound."""
 
     def __init__(self, error_metric=nn.KLDivLoss(size_average=True, reduce=True)):
         super().__init__()
@@ -177,11 +197,6 @@ def hsic_loss(input1, input2, unbiased=False):
     kernel_YY = _kernel(input2, sigma_y)
 
     if unbiased:
-        """Unbiased estimator of Hilbert-Schmidt Independence Criterion
-        Song, Le, et al. "Feature selection via dependence maximization." 2012.
-        """
-        # tK = kernel_XX - torch.diag(torch.diag(kernel_XX))
-        # tL = kernel_YY - torch.diag(torch.diag(kernel_YY))
         tK = kernel_XX - torch.diag(kernel_XX)
         tL = kernel_YY - torch.diag(kernel_YY)
         hsic = (
@@ -191,9 +206,6 @@ def hsic_loss(input1, input2, unbiased=False):
         )
         loss = hsic / (N * (N - 3))
     else:
-        """Biased estimator of Hilbert-Schmidt Independence Criterion
-        Gretton, Arthur, et al. "Measuring statistical dependence with Hilbert-Schmidt norms." 2005.
-        """
         KH = kernel_XX - kernel_XX.mean(0, keepdim=True)
         LH = kernel_YY - kernel_YY.mean(0, keepdim=True)
         loss = torch.trace(KH @ LH / (N - 1) ** 2)
@@ -209,16 +221,6 @@ class Gml_loss(nn.Module):
         super().__init__()
 
     def forward(self, p_o_on_v, v_label, n_c, t=100.0):
-        '''
-
-        Args:
-            p_o_on_v: b,n_v,n_o
-            o_label: b,
-            n_c: b,n_o
-
-        Returns:
-
-        '''
         n_c = n_c[:, 0]
         b = p_o_on_v.shape[0]
         n_o = p_o_on_v.shape[-1]
