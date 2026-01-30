@@ -148,7 +148,8 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             progress_bar.set_postfix({
                 "Total": f"{np.mean(loss_meters['Total'][-50:]):.3f}",
                 "DA":    f"{loss_dict['DA']:.3f}",
-                "Prim":  f"{loss_dict['Prim']:.3f}"
+                "Prim":  f"{loss_dict['Prim']:.3f}",
+                "TE":    f"{loss_dict['TE']:.3f}"
             })
             progress_bar.update()
 
